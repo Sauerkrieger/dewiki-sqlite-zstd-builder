@@ -14,13 +14,22 @@ Staged pipeline, executed strictly in this order:
              * drop "Liste von …" / "Liste der …" title articles.
              * drop {{Stub}} / {{Substub}} articles.
              * drop quality/relevance-template pages: {{Werbung}}, {{PR}},
-               {{Glaskugel}}, {{Recentism}}, {{Belege fehlen}} …
+               {{Glaskugel}}, {{Recentism}} …
                ({{Veraltet}} is explicitly EXEMPT: historical value).
+               {{Belege fehlen}} drops ONLY at article level (bare banner in
+               the lead, or a scope parameter naming no section/table); a
+               section-scoped banner ({{Belege fehlen|…|Dieser Abschnitt}})
+               marks one part and keeps the page (schema v7).
                {{Zukunft}} only drops the page as a LINE-ANCHORED banner;
                inline {{Zukunft|2030}} date notes (infobox "nächste Wahl")
                are harmless and must NOT drop flagships like Berlin/München.
              * drop B-/Z-prominence & Reality-TV/internet-phenomenon
                biographies (title patterns + promo category links).
+             * STAGE 1.8 (v8) junk filters: year/date titles, episode/recap
+               titles, deletion banners ({{SLA}}/{{URV}}), disguised BKLs
+               ("X steht für:") and extended list-title patterns drop the
+               page; niche-but-valid content is demoted to Tier 2 (see
+               decide_tier) — the RAG candidate search only sees Tier 1.
 
     STAGE 2  Regex sanitization (sanitize_wiki_text)
              * strip images/categories/<ref>…</ref>/{{templates}}/HTML tags/
@@ -109,7 +118,23 @@ except ImportError:
 #     note — only a line-anchored banner is disqualifying. This was killing
 #     every article whose infobox has a "nächste Wahl" row (Berlin, München,
 #     Hamburg, Wien, Stuttgart, Bremen, Bayern, ...).
-SCHEMA_VERSION = 6
+# 7 = {{Belege fehlen}} drops pages only at ARTICLE level: the template doc
+#     (Vorlage:Belege fehlen) defines parameter 2 as the SCOPE ("Bezug") — a
+#     banner carrying "Dieser Abschnitt"/"Die folgenden Abschnitte"/"die
+#     folgende Tabelle", or a bare banner placed below a == heading ==, marks
+#     ONE part of the page. The whole-page drop was killing long, valuable
+#     articles like "Lockpicking" (4,379 words; one section banner under
+#     == Sperrelemente ==).
+# 8 = tier filters (RAG hygiene): junk hard-drops (year/date titles, episode
+#     recap titles, deletion banners {{SLA}}/{{URV}}, disguised BKLs ("X steht
+#     für:"), extended list-title patterns) plus the `articles.tier` column
+#     (1 = RAG-visible core, 2 = Reader-only niche) driven by the in-degree
+#     link graph (scripts/build_linkgraph.py): short (< 300 words) AND
+#     unlinked (< 4 incoming links) -> Tier 2, plus demotions for franchise
+#     fiction and taxonomy stubs; >= 2000 words are ALWAYS Tier 1. The chat
+#     candidate search filters tier = 1 (db_jni.cpp falls back gracefully on
+#     legacy DBs without the column).
+SCHEMA_VERSION = 8
 
 # ---------------------------------------------------------------- STAGE 2: sanitization
 
@@ -251,25 +276,107 @@ RE_SKIP_TITLE = re.compile(
     r"Portal|Wikipedia|Spezial|Diskussion|Talk|Benutzer|User|Medium|MediaWiki|"
     r"Modul|Module):", re.IGNORECASE)
 
-RE_LIST_TITLE = re.compile(r"^Liste\s+(von|der)\b", re.IGNORECASE)
+# Filter 5c (schema v8): more list-like title patterns beyond "Liste von/der".
+RE_LIST_TITLE = re.compile(
+    r"^(?:Liste|Verzeichnis|Übersicht|Index)\s+(?:von|der|des|den|dem)\b",
+    re.IGNORECASE)
 RE_REDIRECT = re.compile(r"^\s*#\s*(redirect|weiterleitung)\b", re.IGNORECASE)
 RE_DISAMBIG = re.compile(r"\[\[\s*(?:Kategorie|Category)\s*:\s*Begriffsklärung", re.IGNORECASE)
 RE_STUB_TEMPLATE = re.compile(r"\{\{\s*(?:substub|stub)\s*(?:\||\}\})", re.IGNORECASE)
 
 # STAGE 1.6: quality/relevance template filter. Articles carrying any of these
 # templates are dropped wholesale: advertising/PR, speculation about the future
-# ("Glaskugel"), short-lived internet phenomena, "recentism" and unsourced
-# content. `{{Veraltet}}` is deliberately NOT in this list — outdated articles
-# can still hold valuable historical knowledge (see RE_OLD_TEMPLATE).
+# ("Glaskugel"), short-lived internet phenomena and "recentism". These are
+# inherently WHOLE-ARTICLE verdicts. `{{Veraltet}}` is deliberately NOT in
+# this list — outdated articles can still hold valuable historical knowledge
+# (see RE_OLD_TEMPLATE). `{{Belege fehlen}}` is handled separately below: it
+# is often scoped to a single section and must not drop the whole page.
 RE_QUALITY_TEMPLATE = re.compile(
     r"\{\{\s*(?:"
     r"werbung|ad|advertisement|promotion|promotional|"
     r"pr|"
     r"glaskugel|glaskugel2|"
-    r"recentism|recentismus|aktueller\ event|kurzlebig|zeitgeist|"
-    r"belege\ fehlen|belegt\ nicht"
+    r"recentism|recentismus|aktueller\ event|kurzlebig|zeitgeist"
     r")\s*(?:\||\}\})",
     re.IGNORECASE)
+
+# {{Belege fehlen}} needs SEPARATE handling (schema v7): it drops the page
+# only when it applies to the WHOLE article. The template doc
+# (Vorlage:Belege fehlen) defines parameter 2 as the SCOPE ("Bezug"); its
+# default text is "Dieser Artikel oder nachfolgender Abschnitt". A banner
+# carrying a sectioning parameter 2 ("Dieser Abschnitt", "Die folgenden
+# Abschnitte", "die folgende Tabelle") or placed below a == heading == marks
+# only that part — whole-page drops for it were killing long, valuable
+# articles ("Lockpicking": 4,379 words, one section banner under
+# == Sperrelemente ==).
+RE_CITE_BANNER_START = re.compile(
+    r"\{\{\s*(?:belege\s*fehlen|belegt\s*nicht)\s*[|}]", re.IGNORECASE)
+RE_CITE_SCOPE_SECTION = re.compile(
+    r"abschnitt|absatz|absätz|tabelle", re.IGNORECASE)  # "Absätze" (umlaut plural, Haus) also scopes
+RE_NAMED_PARAM = re.compile(r"\s*(?:\d+|[A-Za-z_]\w*)\s*=")
+RE_FIRST_HEADING = re.compile(r"(?m)^={2,6}")
+
+
+def _article_level_cite_banner(raw: str) -> bool:
+    """True when a {{Belege fehlen}} banner applies to the WHOLE article.
+
+    Walks every banner invocation (brace-matched, safe against nested
+    templates), extracts its top-level parameters and decides the scope:
+      * parameter 2 (positional or named `2=`) present -> article-level only
+        when its text names NO section/table ("Dieser Abschnitt" etc. keep);
+      * parameter 2 absent -> article-level only when the banner sits    in the article LEAD (before the first heading); below a heading the default
+        text ("Dieser Artikel oder nachfolgende Abschnitt") is being used for
+        that section and the page stays. A scope naming ABSÄTZE (paragraphs,
+        "die folgenden beiden Absätze" — the "Haus" case) also keeps the page.
+    """
+    first_heading = RE_FIRST_HEADING.search(raw)
+    lead_end = first_heading.start() if first_heading else len(raw)
+    for m in RE_CITE_BANNER_START.finditer(raw):
+        start = m.start()
+        depth = 0
+        i = start
+        n = len(raw)
+        segments: list[str] = []
+        seg_start = start + 2  # behind '{{' — the first segment is the NAME
+        while i < n:
+            two = raw[i:i + 2]
+            if two == "{{":
+                depth += 1
+                i += 2
+                continue
+            if two == "}}":
+                depth -= 1
+                if depth == 0:
+                    segments.append(raw[seg_start:i])
+                    break
+                i += 2
+                continue
+            if raw[i] == "|" and depth == 1:
+                segments.append(raw[seg_start:i])
+                seg_start = i + 1
+            i += 1
+        if depth != 0:
+            continue  # unmatched braces — ignore this invocation
+        # segments[0] is the template name; the parameters follow. Named
+        # parameters (2=, Plural=) are matched separately; a hint text
+        # containing '=' inside prose does not match the name pattern.
+        positional: list[str] = []
+        named_two: str | None = None
+        for seg in segments[1:]:
+            if RE_NAMED_PARAM.match(seg):
+                key, _, value = seg.partition("=")
+                if key.strip() == "2":
+                    named_two = value
+            else:
+                positional.append(seg)
+        scope = named_two if named_two is not None else (
+            positional[1] if len(positional) >= 2 else None)
+        if scope is not None:
+            if not RE_CITE_SCOPE_SECTION.search(scope):
+                return True  # explicit non-section scope (whole article)
+        elif start < lead_end:
+            return True  # bare banner in the lead: whole-article placement
+    return False
 # {{Zukunft}} family handled separately: on dewiki the inline form
 # ("nächste Wahl: 2030{{Zukunft|2030}}" in infoboxes/tables) is a mere DATE
 # NOTE — flagships like Berlin, München, Hamburg, Wien, Stuttgart, Bremen and
@@ -324,6 +431,132 @@ RE_LINK_NAMESPACE = re.compile(
 
 RE_ANY_WIKILINK = re.compile(r"\[\[([^\[\]]+)\]\]")
 
+# ------------------------------------------------- STAGE 1.8: junk filters (schema v8)
+# The DB feeds a RAG pipeline: pages whose TITLES match frequent query words
+# (years, months, episode numbers, character names) while carrying little
+# knowledge crowd the top-40 candidate window. Pure noise drops outright;
+# niche-but-valid content is demoted to Tier 2 (see decide_tier) — the chat
+# candidate search only sees Tier 1, the Reader searches everything.
+
+# Filter 3: year/calendar navigation pages — they match EVERY year or date
+# in a question and, with bm25(title x10), always land in the candidates.
+RE_YEAR_TITLE = re.compile(r"^\d{1,4}(?:\s+v\.\s*Chr\.)?$")
+RE_DATE_TITLE = re.compile(
+    r"^\d{1,2}\.\s+(?:januar|februar|märz|april|mai|juni|juli|august|"
+    r"september|oktober|november|dezember)$", re.IGNORECASE)
+RE_CENTURY_TITLE = re.compile(
+    r"^\d{1,2}\.\s+jahrhundert(?:\s+v\.\s*chr\.?)?$", re.IGNORECASE)
+
+# Filter 5a: deletion-process banners — the page is on its way out of
+# Wikipedia (often vandalism, hoaxes or copyright violations).
+RE_DELETE_BANNER = re.compile(
+    r"\{\{\s*(?:sla|löschantrag(?:stext)?|urv)\s*[|}]", re.IGNORECASE)
+
+# Filter 2: TV/serial fiction noise (arabic numerals only — roman-numeral
+# film titles like "Episode IV" stay). Episode/season pages are plot recaps
+# with zero reference value.
+RE_EPISODE_TITLE = re.compile(
+    r"\b(?:folge|staffel|episode|kapitel|teil)\s+\d+\b"
+    r"|\b\d+\.\s*(?:folge|staffel|episode|kapitel|teil)\b"
+    r"|\b(?:folgen?|staffeln?|episoden)liste\b"
+    r"|\(episode\)", re.IGNORECASE)
+# Franchise-scoped pages ("… (Figur)", "… (Orte)") are DEMOTED, not dropped:
+# their titles still carry the series' proper names.
+RE_FICTION_SCOPE_TITLE = re.compile(
+    r"\((?:figur|figuren|personen?|charaktere?|orte?|schauplätze?|handlung|"
+    r"welten?|universum)\)$", re.IGNORECASE)
+RE_FICTION_CATEGORY = re.compile(
+    r"\[\[\s*(?:Kategorie|Category)\s*:[^\]]*(?:"
+    r"fernsehserien-?episode|episodenliste|"
+    r"figur\s+(?:in|aus)|figuren\s+(?:in|aus)|personen?\s+(?:in|aus)"
+    r")[^\]]*\]\]", re.IGNORECASE)
+
+# Filter 4: taxonomy stubs — species articles carry {{Taxobox}}; the vast
+# majority are tiny stubs relevant only to a specialist (latin-name) query.
+RE_TAXON_BOX = re.compile(r"\{\{\s*taxobox\s*[|}]", re.IGNORECASE)
+
+# Filter 5b: disguised BKLs — the app filters "X steht für:" leads at runtime
+# (SPEC §3.1); doing it in the build keeps the Reader clean too. The colon
+# separates BKL lists from legit leads ("ADSL steht für Asymmetric …").
+RE_BKL_LEAD = re.compile(r"^[^\n]{0,150}\bsteht für\s*:", re.IGNORECASE)
+
+
+# ------------------------------------------------------- tier decision (schema v8)
+# Tier 1 = RAG-visible core (chat candidate search); Tier 2 = niche,
+# searchable in the Reader only. Demotion is deliberate: a niche article
+# that CANNOT hurt retrieval loses nothing by being invisible to the chat —
+# but it stays readable (no knowledge hole in Tab 2).
+TIER2_MIN_WORDS = 300       # short pages need external validation (links)
+TIER2_MIN_INDEGREE = 4      # < 4 incoming links AND short -> niche
+TIER1_LENGTH_RESCUE = 2000  # substance outranks popularity: always Tier 1
+TAXON_STUB_WORDS = 150      # {{Taxobox}} pages below this are Tier 2
+
+
+def decide_tier(title: str, raw: str, words: int, indegree: int | None) -> int:
+    """1 = RAG-visible core, 2 = niche (Reader-only). SPEC §4.1 filters.
+
+    *indegree* is the redirect-resolved incoming-link count from the Pass-0
+    link graph (scripts/build_linkgraph.py); None disables the in-degree
+    rule (no graph available — everything else stays Tier 1).
+    """
+    # Substance rescue first: long articles never leave Tier 1 — depth IS
+    # the quality signal, and it protects specialist knowledge ("Lockpicking",
+    # 4,379 words) no matter how popular it is.
+    if words >= TIER1_LENGTH_RESCUE:
+        return 1
+    # Filter 2: franchise-scoped fiction pages (plot characters, settings).
+    if RE_FICTION_SCOPE_TITLE.search(title) or RE_FICTION_CATEGORY.search(raw):
+        return 2
+    # Filter 4: taxonomy stubs.
+    if RE_TAXON_BOX.search(raw) and words < TAXON_STUB_WORDS:
+        return 2
+    # Filter 1: short AND unlinked -> niche. Wikipedia's link graph is its
+    # own importance signal — contributors link what matters. The CONJUNCTION
+    # matters: a short but well-linked definition stays Tier 1.
+    if indegree is not None and indegree < TIER2_MIN_INDEGREE and words < TIER2_MIN_WORDS:
+        return 2
+    return 1
+
+
+def fnv1a32(s: str) -> int:
+    """FNV-1a 32-bit over UTF-8 — MUST match scripts/build_linkgraph.py (the
+    graph keys targets by this hash of the normalized title)."""
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h ^= b
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def norm_title(s: str) -> str:
+    """MediaWiki title normalization (MUST match build_linkgraph.py):
+    underscores -> spaces, whitespace collapsed, only the FIRST character
+    case-insensitive (full casefold collides case-variant pages — "MOND"
+    vs "Mond")."""
+    s2 = re.sub(r"\s+", " ", (s or "").replace("_", " ").strip())
+    return s2[:1].upper() + s2[1:] if s2 else s2
+
+
+class LinkGraph:
+    """Read-only view of the Pass-0 link graph (scripts/build_linkgraph.py).
+
+    Maps a page title to its redirect-resolved incoming-link count. Titles
+    are matched through the same fnv1a32/casefold normalization the graph
+    was built with, so title/namespace variations resolve identically.
+    """
+
+    def __init__(self, path: str):
+        self.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+    def indegree(self, title: str) -> int:
+        row = self.conn.execute(
+            "SELECT indegree FROM targets WHERE h = ?",
+            (fnv1a32(norm_title(title)),)).fetchone()
+        return row[0] if row else 0
+
+    def close(self) -> None:
+        self.conn.close()
+
 
 def count_words(text: str) -> int:
     """Word count of the cleaned prose (STAGE 3.1)."""
@@ -368,7 +601,10 @@ def process_page(title: str, raw: str, min_words: int, max_link_ratio: float):
     # {{Veraltet}} (outdated but historically valuable content is kept).
     # {{Zukunft}} only counts as a line-anchored banner (see RE_ZUKUNFT_BANNER):
     # inline {{Zukunft|2030}} date notes in infoboxes must NOT drop the page.
-    if ((RE_QUALITY_TEMPLATE.search(raw) or RE_ZUKUNFT_BANNER.search(raw))
+    # {{Belege fehlen}} counts only at ARTICLE level (see
+    # _article_level_cite_banner): a section-scoped banner marks one part.
+    if ((RE_QUALITY_TEMPLATE.search(raw) or RE_ZUKUNFT_BANNER.search(raw)
+            or _article_level_cite_banner(raw))
             and not RE_OLD_TEMPLATE.search(raw)):
         return None, "quality-template"
     # STAGE 1.7: B-/Z-prominence & Reality-TV/internet-phenomenon filter.
@@ -377,7 +613,21 @@ def process_page(title: str, raw: str, min_words: int, max_link_ratio: float):
     if RE_PROMO_TITLE.search(title) or RE_PROMO_TITLE_YEAR.search(title):
         return None, "promo-title"
 
+    # STAGE 1.8 (schema v8): pure-noise & navigation pages drop outright.
+    if RE_YEAR_TITLE.match(title):
+        return None, "year-title"
+    if RE_DATE_TITLE.match(title) or RE_CENTURY_TITLE.match(title):
+        return None, "date-title"
+    if RE_EPISODE_TITLE.search(title):
+        return None, "episode-title"
+    if RE_DELETE_BANNER.search(raw):
+        return None, "deletion-banner"
+
     sanitized = sanitize_wiki_text(raw)
+    # STAGE 1.8: disguised BKL ("X steht für:" lead) — content-based, so it
+    # also catches unlabeled disambiguation pages without the category.
+    if RE_BKL_LEAD.match(sanitized):
+        return None, "disambiguation"
     words = count_words(sanitized)
     if words < min_words:
         return None, "too-short"
@@ -507,7 +757,8 @@ CREATE TABLE IF NOT EXISTS articles (
     content_sample TEXT,
     chunk_id INTEGER NOT NULL,
     offset INTEGER NOT NULL,
-    length INTEGER NOT NULL
+    length INTEGER NOT NULL,
+    tier INTEGER NOT NULL DEFAULT 1          -- 1 = RAG-visible, 2 = Reader-only (v8)
 );
 """# External content table: FTS5 stores ONLY the inverted index; title/sample are
 # read from `articles` on demand, so nothing is duplicated (SPEC STAGE 4.2).
@@ -590,10 +841,10 @@ class ArticleSink:
         self.duplicates = 0
         self._since_commit = 0
 
-    def add(self, title: str, text: str) -> None:
+    def add(self, title: str, text: str, tier: int = 1) -> None:
         data = text.encode("utf-8")
         sample = text[:LEAD_SAMPLE_CHARS].replace("\n", " ")
-        self._pending.append((title, sample, len(self._buf), len(data)))
+        self._pending.append((title, sample, len(self._buf), len(data), tier))
         self._buf += data
         if len(self._pending) >= self.chunk_size:
             self.flush()
@@ -604,12 +855,12 @@ class ArticleSink:
         blob = self.cctx.compress(bytes(self._buf))
         self.cur.execute("INSERT INTO chunks (data) VALUES (?)", (blob,))
         chunk_id = self.cur.lastrowid
-        for title, sample, offset, length in self._pending:
+        for title, sample, offset, length, tier in self._pending:
             try:
                 self.cur.execute(
-                    "INSERT INTO articles (title, content_sample, chunk_id, offset, length) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (title, sample, chunk_id, offset, length))
+                    "INSERT INTO articles (title, content_sample, chunk_id, offset, length, tier) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (title, sample, chunk_id, offset, length, tier))
             except sqlite3.IntegrityError:
                 self.duplicates += 1  # duplicate title (UNIQUE) — skip this row
                 continue
@@ -640,8 +891,13 @@ def finalize(conn: sqlite3.Connection) -> None:
 
 
 def build(db_path: str, pages, level: int, commit_every: int, min_words: int,
-          chunk_size: int, max_link_ratio: float) -> None:
-    """Single-process build from any page iterator (used by tests and --dump)."""
+          chunk_size: int, max_link_ratio: float,
+          indegree_fn=None) -> None:
+    """Single-process build from any page iterator (used by tests and --dump).
+
+    *indegree_fn* maps a title to its incoming-link count (Pass-0 link
+    graph); None disables the in-degree tier rule.
+    """
     if os.path.exists(db_path):
         os.remove(db_path)
         print(f"Removed existing {db_path}")
@@ -655,7 +911,9 @@ def build(db_path: str, pages, level: int, commit_every: int, min_words: int,
         if t is None:
             skipped += 1
             continue
-        sink.add(t, result)
+        tier = decide_tier(t, raw, count_words(result),
+                           indegree_fn(t) if indegree_fn else None)
+        sink.add(t, result, tier)
         seen += 1
         if seen % 20000 == 0:
             size_gb = os.path.getsize(db_path) / 1e9
@@ -705,6 +963,7 @@ def _build_part(job: dict) -> dict:
     max_link_ratio = job["max_link_ratio"]
     chunk_size = job["chunk_size"]
     commit_every = job["commit_every"]
+    graph = LinkGraph(job["linkgraph"]) if job.get("linkgraph") else None
 
     tmp_path = out_path + ".tmp"
     if os.path.exists(tmp_path):
@@ -721,8 +980,12 @@ def _build_part(job: dict) -> dict:
         if t is None:
             skipped += 1
             continue
-        sink.add(t, result)
+        tier = decide_tier(t, raw, count_words(result),
+                           graph.indegree(t) if graph else None)
+        sink.add(t, result, tier)
     sink.finish()
+    if graph:
+        graph.close()
     conn.close()
 
     os.replace(tmp_path, out_path)
@@ -774,8 +1037,8 @@ def merge_parts(out_db: str, part_dbs: list[str]) -> None:
         # Page-id ranges are disjoint across parts -> duplicate titles are
         # virtually impossible; OR IGNORE keeps the merge robust anyway.
         _retry_locked(lambda: conn.execute(
-            "INSERT OR IGNORE INTO articles (title, content_sample, chunk_id, offset, length) "
-            "SELECT title, content_sample, chunk_id + ?, offset, length FROM p.articles",
+            "INSERT OR IGNORE INTO articles (title, content_sample, chunk_id, offset, length, tier) "
+            "SELECT title, content_sample, chunk_id + ?, offset, length, tier FROM p.articles",
             (base,)))
         inserted = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0] - before
         _retry_locked(lambda: conn.execute("DETACH DATABASE p"))
@@ -804,6 +1067,16 @@ def run_parts_mode(args: argparse.Namespace) -> None:
     if not dumps:
         sys.exit(f"No dewiki-*.bz2 dump parts found in {parts_dir}")
 
+    # Pass-0 link graph (scripts/build_linkgraph.py): enables the in-degree
+    # tier rule. Missing graph = rule disabled (everything else Tier 1).
+    linkgraph_arg = getattr(args, "linkgraph", "") or ""
+    linkgraph_path = linkgraph_arg if linkgraph_arg and os.path.exists(linkgraph_arg) else ""
+    if linkgraph_arg and not linkgraph_path:
+        print(f">> WARNING: link graph {linkgraph_arg} not found — "
+              f"in-degree tier rule disabled")
+    elif linkgraph_path:
+        print(f">> Link graph: {linkgraph_path}")
+
     jobs: list[dict] = []
     for d in dumps:
         out = _part_db_path(parts_dir, d)
@@ -812,7 +1085,8 @@ def run_parts_mode(args: argparse.Namespace) -> None:
             continue
         jobs.append({"dump": d, "out": out, "level": args.level,
                      "min_words": args.min_words, "max_link_ratio": args.max_link_ratio,
-                     "chunk_size": args.chunk_size, "commit_every": args.commit_every})
+                     "chunk_size": args.chunk_size, "commit_every": args.commit_every,
+                     "linkgraph": linkgraph_path})
 
     if jobs:
         workers = min(args.workers, len(jobs))
@@ -863,6 +1137,9 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2),
                     help="parallel part workers (--parts-dir only)")
     ap.add_argument("--commit-every", type=int, default=2000)
+    ap.add_argument("--linkgraph", default=os.path.join("wiki_build", "linkgraph.db"),
+                    help="Pass-0 link graph (scripts/build_linkgraph.py); enables "
+                         "the in-degree tier rule (missing file = disabled)")
     args = ap.parse_args()
 
     if not 1 <= args.level <= 19:
@@ -875,9 +1152,16 @@ def main() -> None:
         return
 
     pages = iter_dump_pages(args.dump) if args.dump else iter_extracted_pages(args.extracted)
+    graph = None
+    if args.linkgraph and os.path.exists(args.linkgraph):
+        graph = LinkGraph(args.linkgraph)
+        print(f">> Link graph: {args.linkgraph}")
+    elif args.linkgraph:
+        print(f">> Link graph {args.linkgraph} not found — in-degree tier rule disabled")
     print(f"Building {args.db} (zstd level {args.level}, chunk size {args.chunk_size}) ...")
     build(args.db, pages, args.level, args.commit_every, args.min_words,
-          args.chunk_size, args.max_link_ratio)
+          args.chunk_size, args.max_link_ratio,
+          indegree_fn=(graph.indegree if graph else None))
 
 
 if __name__ == "__main__":
