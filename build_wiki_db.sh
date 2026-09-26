@@ -63,8 +63,19 @@ done
 wait
 echo ">> All dump parts present."
 
-# 2) Build the DB directly from the parts (parallel workers + merge)
-BUILD_ARGS=(--parts-dir "$PARTS_DIR" --db "$OUT" --level "$LEVEL")
+# 2) Pass 0: build the in-degree link graph (tier filter signal, SPEC §4.1
+#    filter 1) — skipped when already present. A missing graph only disables
+#    the in-degree rule; the build itself still works.
+LINKGRAPH="$WORKDIR/linkgraph.db"
+if [ ! -f "$LINKGRAPH" ]; then
+  python "$SCRIPT_DIR/build_linkgraph.py" --parts-dir "$PARTS_DIR" \
+      --out "$LINKGRAPH" --workers "${LINKGRAPH_WORKERS:-8}"
+else
+  echo ">> skip (present): $LINKGRAPH"
+fi
+
+# 3) Build the DB directly from the parts (parallel workers + merge)
+BUILD_ARGS=(--parts-dir "$PARTS_DIR" --db "$OUT" --level "$LEVEL" --linkgraph "$LINKGRAPH")
 if [ -n "$WORKERS" ]; then
   BUILD_ARGS+=(--workers "$WORKERS")
 fi
